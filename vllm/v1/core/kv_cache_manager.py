@@ -4,7 +4,7 @@
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import TYPE_CHECKING, Literal, Optional, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
@@ -18,6 +18,10 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
+
+if TYPE_CHECKING:
+    from vllm.config.optane import OptaneConfig
+    from vllm.v1.core.optane_manager import OptaneManager, OptaneManagerStats
 
 logger = init_logger(__name__)
 
@@ -123,6 +127,7 @@ class KVCacheManager:
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
+        optane_config: Optional["OptaneConfig"] = None,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -178,6 +183,40 @@ class KVCacheManager:
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
 
+        # Optane persistent memory tier integration.
+        # optane_manager is None when Optane is disabled (default).
+        self.optane_manager: Optional["OptaneManager"] = None
+        if optane_config is not None and optane_config.is_enabled():
+            self._init_optane_manager(optane_config)
+
+    def _init_optane_manager(self, optane_config: "OptaneConfig") -> None:
+        """Initialize the OptaneManager for Optane tier management.
+
+        Called during __init__ when Optane is enabled. Failures are logged
+        and Optane is disabled gracefully so the engine can continue without it.
+
+        Args:
+            optane_config: Validated Optane configuration.
+        """
+        try:
+            from vllm.v1.core.optane_manager import OptaneManager
+
+            self.optane_manager = OptaneManager(
+                optane_config=optane_config,
+                block_pool=self.block_pool,
+                enable_metrics=optane_config.optane_enable_metrics,
+            )
+            logger.info(
+                "OptaneManager initialized: policy=%s, cache_size=%.2f GiB",
+                optane_config.optane_eviction_policy,
+                optane_config.optane_cache_size or 0.0,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to initialize OptaneManager; Optane tier disabled"
+            )
+            self.optane_manager = None
+
     @property
     def usage(self) -> float:
         """Get the KV cache usage.
@@ -198,6 +237,103 @@ class KVCacheManager:
         stats = self.prefix_cache_stats
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
+
+    # ------------------------------------------------------------------
+    # Optane tier management methods
+    # ------------------------------------------------------------------
+
+    def get_optane_stats(self) -> Optional["OptaneManagerStats"]:
+        """Return current Optane tier statistics.
+
+        Returns:
+            OptaneManagerStats when Optane is enabled, else None.
+        """
+        if self.optane_manager is None:
+            return None
+        return self.optane_manager.get_stats()
+
+    def should_manage_optane_tier(self) -> bool:
+        """Determine whether Optane tier management should run this step.
+
+        Returns True when Optane is enabled and GPU memory pressure is high
+        enough to warrant active block promotion/demotion.
+
+        Returns:
+            True if Optane tier management should be performed.
+        """
+        if self.optane_manager is None:
+            return False
+        # Trigger management when GPU usage exceeds 70 %.
+        return self.usage >= 0.7
+
+    def promote_cold_blocks_to_optane(self, num_candidates: int = 8) -> int:
+        """Promote cold (rarely-accessed) GPU blocks to Optane.
+
+        Examines cold blocks tracked by the eviction policy and moves them
+        to Optane persistent memory, freeing GPU memory for new allocations.
+
+        Args:
+            num_candidates: Maximum number of blocks to promote per call.
+
+        Returns:
+            Number of blocks actually promoted.
+        """
+        if self.optane_manager is None:
+            return 0
+
+        promoted = 0
+        try:
+            # Ask the eviction policy for cold candidate block IDs.
+            from vllm.core.eviction_policy_optane import EvictionTier
+
+            candidates = (
+                self.optane_manager.eviction_policy.select_eviction_candidates(
+                    num_candidates=num_candidates, tier=EvictionTier.GPU
+                )
+                if self.optane_manager.eviction_policy is not None
+                else []
+            )
+            for block_id in candidates:
+                # Create a lightweight placeholder block for the manager.
+                mock_block = KVCacheBlock(block_id)
+                self.optane_manager.on_block_evicted(mock_block)
+                promoted += 1
+        except Exception:
+            logger.exception("Error during promote_cold_blocks_to_optane")
+        return promoted
+
+    def demote_hot_blocks_from_optane(self, num_candidates: int = 8) -> int:
+        """Demote hot (frequently-accessed) Optane blocks back to GPU.
+
+        Retrieves blocks from Optane that have been accessed recently and
+        promotes them to GPU memory for lower-latency access.
+
+        Args:
+            num_candidates: Maximum number of blocks to demote per call.
+
+        Returns:
+            Number of blocks actually demoted.
+        """
+        if self.optane_manager is None:
+            return 0
+
+        demoted = 0
+        try:
+            # Collect blocks currently tracked in Optane tier.
+            from vllm.core.eviction_policy_optane import EvictionTier
+
+            optane_block_ids = [
+                bid
+                for bid, tier in self.optane_manager.block_to_tier.items()
+                if tier == EvictionTier.OPTANE
+            ]
+            for block_id in optane_block_ids[:num_candidates]:
+                mock_block = KVCacheBlock(block_id)
+                self.optane_manager.on_block_prefetched(mock_block)
+                demoted += 1
+        except Exception:
+            logger.exception("Error during demote_hot_blocks_from_optane")
+        return demoted
 
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
