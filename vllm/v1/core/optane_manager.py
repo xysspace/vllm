@@ -21,7 +21,7 @@ from vllm.core.eviction_policy_optane import (
 from vllm.distributed.kv_events_optane import OptaneEventQueue
 from vllm.logger import init_logger
 from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.core.block_pool_optane import OptaneBlockPool, OptaneBlockMetadata
+from vllm.v1.core.block_pool_optane import OptaneBlockPool
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 
 logger = init_logger(__name__)
@@ -168,15 +168,14 @@ class OptaneManager:
             self.block_to_tier[block.block_id] = EvictionTier.OPTANE
             if self.enable_metrics:
                 self.stats.optane_tier.num_blocks += 1
+                self.stats.total_blocks_allocated += 1
             return BlockTierPlacement.OPTANE
         else:
             self.block_to_tier[block.block_id] = EvictionTier.GPU
             if self.enable_metrics:
                 self.stats.gpu_tier.num_blocks += 1
-
+                self.stats.total_blocks_allocated += 1
             return BlockTierPlacement.GPU
-
-        self.stats.total_blocks_allocated += 1
 
     def on_block_freed(self, block: KVCacheBlock) -> None:
         """
@@ -230,12 +229,15 @@ class OptaneManager:
             return
 
         # Get eviction candidates to determine promotion priority
-        candidates = self.eviction_policy.get_candidates(
-            num_candidates=1, block=block
+        candidates = self.eviction_policy.select_eviction_candidates(
+            num_candidates=1, tier=EvictionTier.GPU
         )
 
         if candidates:
-            next_tier = self.eviction_policy.get_next_tier(current_tier)
+            # Determine next tier from cascade policy if available
+            next_tier = EvictionTier.OPTANE
+            if hasattr(self.eviction_policy, "get_next_tier"):
+                next_tier = self.eviction_policy.get_next_tier(current_tier) or EvictionTier.OPTANE
 
             if next_tier == EvictionTier.OPTANE:
                 # Mark block for promotion to Optane
